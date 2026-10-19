@@ -1,81 +1,94 @@
-name: Permanent Linux SSH Server
+name: Linux SSH Server (Tailscale)
 
+# Sadece elle başlatılır (Actions > Run workflow). Otomatik çalışma yok.
 on:
-  schedule:
-    - cron: '0 */6 * * *'  # روشن شدن خودکار هر ۶ ساعت یک‌بار (۲۴/۷)
-  workflow_dispatch:        # استارت دستی با دکمه Run
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
-  build:
+  ssh-server:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 355
 
     steps:
-      - name: 1. Checkout Repository
-        uses: actions/checkout@v4
+      - name: 1. Kullanıcıyı ve SSH'ı kur (sadece anahtar ile giriş)
+        env:
+          SSH_PUBKEY: ${{ secrets.SSH_PUBKEY }}
+        run: |
+          set -e
+          if [ -z "$SSH_PUBKEY" ]; then
+            echo "HATA: SSH_PUBKEY secret'ı tanımlı değil."; exit 1
+          fi
 
-      # بازیابی هارد ابری دائمی
-      - name: 2. Restore Persistent Workspace
+          sudo apt-get update
+          sudo apt-get install -y openssh-server
+
+          # Kullanıcı (şifresiz, sadece anahtar ile girilecek)
+          sudo useradd -m -s /bin/bash cynetadmin || true
+          sudo passwd -l cynetadmin
+          sudo usermod -aG sudo cynetadmin
+          echo "cynetadmin ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/cynetadmin
+          sudo chmod 440 /etc/sudoers.d/cynetadmin
+
+          # Public key
+          sudo mkdir -p /home/cynetadmin/.ssh
+          echo "$SSH_PUBKEY" | sudo tee /home/cynetadmin/.ssh/authorized_keys > /dev/null
+          sudo chown -R cynetadmin:cynetadmin /home/cynetadmin/.ssh
+          sudo chmod 700 /home/cynetadmin/.ssh
+          sudo chmod 600 /home/cynetadmin/.ssh/authorized_keys
+
+          # sshd ayarı: 00- öneki ile diğer dosyalardan önce okunur (ilk eşleşen kazanır)
+          sudo tee /etc/ssh/sshd_config.d/00-hardening.conf > /dev/null <<'EOF'
+          PasswordAuthentication no
+          KbdInteractiveAuthentication no
+          PermitRootLogin no
+          PubkeyAuthentication yes
+          AllowUsers cynetadmin
+          EOF
+          sudo sshd -t
+          sudo systemctl restart ssh
+
+      - name: 2. Kalıcı klasörü hazırla
+        run: |
+          sudo mkdir -p /home/cynetadmin/workspace
+          # Cache işlemi runner kullanıcısıyla çalışır, geçici olarak ona ver
+          sudo chown -R runner:runner /home/cynetadmin/workspace
+
+      - name: 3. Kalıcı klasörü geri yükle
         uses: actions/cache@v4
         with:
           path: /home/cynetadmin/workspace
-          key: cynet-ssh-workspace-${{ github.run_id }}
+          key: ssh-workspace-${{ github.run_id }}
           restore-keys: |
-            cynet-ssh-workspace-
+            ssh-workspace-
 
-      - name: 3. Setup OpenSSH Server
+      - name: 4. Klasör sahipliğini cynetadmin'e ver
         run: |
-          sudo apt-get update
-          sudo apt-get install -y openssh-server
-          
-          # فعال‌سازی لاگین با پسورد
-          sudo sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
-          sudo sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config
-          sudo systemctl restart ssh
-
-      - name: 4. Create User (cynetadmin) with Root Access
-        run: |
-          sudo useradd -m -s /bin/bash cynetadmin || true
-          echo "cynetadmin:Cynet@2026" | sudo chpasswd
-          sudo usermod -aG sudo cynetadmin
-          echo "cynetadmin ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/cynetadmin
-          
-          # ساخت و مجوز پوشه هارد دائمی
-          sudo mkdir -p /home/cynetadmin/workspace
           sudo chown -R cynetadmin:cynetadmin /home/cynetadmin/workspace
+          # Job sonunda cache kaydı için okunabilir olsun
+          sudo chmod -R a+rX /home/cynetadmin/workspace
 
-      - name: 5. Connect Tailscale VPN & Show Access Info
+      - name: 5. Tailscale bağlantısı
         env:
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
         run: |
           curl -fsSL https://tailscale.com/install.sh | sh
           sudo tailscale up --authkey="$TAILSCALE_AUTHKEY" --hostname="cynet-linux-ssh"
-          
           TS_IP=$(tailscale ip -4)
-          
-          echo "=================================================="
-          echo "  >>> PERMANENT LINUX SSH SERVER IS LIVE! <<<"
-          echo "  Tailscale IP  : $TS_IP"
-          echo "  Username      : cynetadmin"
-          echo "  Password      : Cynet@2026"
-          echo "  ------------------------------------------------"
-          echo "  💻 Connect via Terminal / CMD:"
-          echo "  >> ssh cynetadmin@$TS_IP"
-          echo "  ------------------------------------------------"
-          echo "  💾 Persistent Folder : /home/cynetadmin/workspace"
-          echo "=================================================="
+          echo "=============================================="
+          echo " SSH sunucusu hazır"
+          echo " Bağlanmak için: ssh cynetadmin@$TS_IP"
+          echo " Kalıcı klasör : /home/cynetadmin/workspace"
+          echo "=============================================="
 
-      - name: 6. Server Keep-Alive (5h 55m)
+      - name: 6. Sunucuyu açık tut (5s 40dk)
         run: |
-          for i in {1..355}; do
+          for i in $(seq 1 340); do
             sleep 60
-            echo "[$i/355] Linux SSH Server is active..."
+            echo "[$i/340] SSH sunucusu aktif..."
           done
 
-      # ذخیره خودکار فایل‌های پوشه دائمی قبل از ری‌استارت
-      - name: 7. Save Workspace to Cloud
-        uses: actions/cache@v4
-        if: always()
-        with:
-          path: /home/cynetadmin/workspace
-          key: cynet-ssh-workspace-${{ github.run_id }}
+      # Cache kaydı, job bitince actions/cache'in post-step'i ile otomatik yapılır.
+      # Ayrı bir "save" adımına gerek yok.
