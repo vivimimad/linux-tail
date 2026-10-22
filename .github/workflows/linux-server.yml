@@ -47,6 +47,7 @@ jobs:
           PubkeyAuthentication yes
           AllowUsers cynetadmin
           EOF
+          sudo mkdir -p /run/sshd
           sudo sshd -t
           sudo systemctl restart ssh
 
